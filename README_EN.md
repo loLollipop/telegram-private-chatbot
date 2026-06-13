@@ -63,10 +63,9 @@ Version 4.0 removes all unstable external API dependencies, focusing on **extrem
 ### Prerequisites
 1.  **Telegram Bot**: Apply for a bot from [@BotFather](https://t.me/BotFather) and get the `Token`.
     * *Important*: Turn off **Group Privacy** in BotFather (`/mybots` > Settings > Group Privacy > Turn off).
-2.  **Administrator Group**: Create a Telegram group and **enable Topics**.
-    * Add the bot to the group and set it as an **Administrator** (grant "Manage Topics" permission).
-    * Get the Group ID (usually starts with `-100`).
-    > **Tip for getting SUPERGROUP_ID**: In Telegram Desktop, right-click any message in the group and copy the message link. The link will contain a segment like `-100xxxxxxxxxx` or `xxxxxxxxxx`. If you only see numbers `xxxxxxxxxx`, add `-100` in front to get the full `SUPERGROUP_ID` (same applies to private channels/groups).
+2.  **Admin private chat**: Open a private chat with your bot and send `/start`.
+    * Set `ADMIN_CHAT_ID` to your Telegram numeric user ID.
+    * In private mode, no administrator group, topics, or `SUPERGROUP_ID` is required.
 
 ### Method 1: One-Click Deploy via GitHub (Recommended ★)
 
@@ -89,7 +88,7 @@ This is the simplest automated deployment method. Cloudflare will automatically 
         * Click **Add binding**, set Variable name to `TOPIC_MAP` (must be uppercase), and select the Namespace you just created.
     * **Add Environment Variables**:
         * `BOT_TOKEN`: Your bot token.
-        * `SUPERGROUP_ID`: Your group ID (e.g., -100123...).
+        * `ADMIN_CHAT_ID`: Your Telegram numeric user ID.
 8.  **Final Step**: After configuration, go to the **Deployments** tab at the top, find the latest deployment record, and click **Retry deployment** on the right to apply variables.
 
 ### Method 2: Manual Deployment (Simple & Direct)
@@ -104,7 +103,7 @@ If you don't want to link GitHub, you can copy the code directly.
 6.  **Configure KV & Variables**:
     * Go to **Settings** -> **Variables**.
     * Add KV Binding: Variable name `TOPIC_MAP`, bind to a KV database.
-    * Add Environment Variables: `BOT_TOKEN` and `SUPERGROUP_ID`.
+    * Add Environment Variables: `BOT_TOKEN` and `ADMIN_CHAT_ID`.
     * Click **Save and Deploy**.
 
 ---
@@ -128,8 +127,8 @@ If it returns `{"ok":true, "result":true, "description":"Webhook was set"}`, the
 **Q: Why does clicking the verification button do nothing?**
 A: Please check if the Webhook is set correctly. You must ensure Telegram is allowed to send `callback_query` events. Please perform the reset operation in the "Final Step" above.
 
-**Q: Why can't the bot create topics in the group?**
-A: Please ensure: 1. Group ID is correct (starts with -100); 2. Topics are enabled in the group; 3. The bot is an administrator and has "Manage Topics" permission.
+**Q: How do I reply to a user?**
+A: Reply directly to the copied user message or the user info message in your private chat with the bot.
 
 ---
 

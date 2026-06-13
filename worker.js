@@ -375,18 +375,18 @@ export default {
     // 环境自检
     if (!env.TOPIC_MAP) return new Response("Error: KV 'TOPIC_MAP' not bound.");
     if (!env.BOT_TOKEN) return new Response("Error: BOT_TOKEN not set.");
-    if (!env.SUPERGROUP_ID) return new Response("Error: SUPERGROUP_ID not set.");
+    if (!env.ADMIN_CHAT_ID) return new Response("Error: ADMIN_CHAT_ID not set.");
 
     // 【修复 #7】规范化环境变量，统一为字符串类型
     const normalizedEnv = {
         ...env,
-        SUPERGROUP_ID: String(env.SUPERGROUP_ID),
+        ADMIN_CHAT_ID: String(env.ADMIN_CHAT_ID),
         BOT_TOKEN: String(env.BOT_TOKEN)
     };
 
     // 验证 SUPERGROUP_ID 格式
-    if (!normalizedEnv.SUPERGROUP_ID.startsWith("-100")) {
-        return new Response("Error: SUPERGROUP_ID must start with -100");
+    if (!normalizedEnv.ADMIN_CHAT_ID.trim()) {
+        return new Response("Error: ADMIN_CHAT_ID is empty");
     }
 
     if (request.method !== "POST") return new Response("OK");
@@ -420,8 +420,6 @@ export default {
     const msg = update.message;
     if (!msg) return new Response("OK");
 
-    ctx.waitUntil(flushExpiredMediaGroups(normalizedEnv, Date.now()));
-
     if (msg.chat && msg.chat.type === "private") {
       try {
         await handlePrivateMessage(msg, normalizedEnv, ctx);
@@ -435,7 +433,7 @@ export default {
     }
 
     // 【修复 #7】使用字符串比较
-    if (msg.chat && String(msg.chat.id) === normalizedEnv.SUPERGROUP_ID) {
+    if (false && msg.chat && String(msg.chat.id) === normalizedEnv.SUPERGROUP_ID) {
         if (msg.forum_topic_closed && msg.message_thread_id) {
             await updateThreadStatus(msg.message_thread_id, true, normalizedEnv);
             return new Response("OK");
@@ -460,9 +458,204 @@ export default {
 
 // ---------------- 核心业务逻辑 ----------------
 
+function getAdminChatId(env) {
+  return String(env.ADMIN_CHAT_ID || "").trim();
+}
+
+function isAdminMessage(msg, env) {
+  return String(msg.chat?.id) === getAdminChatId(env);
+}
+
+function userDisplayName(from = {}) {
+  const parts = [from.first_name, from.last_name].filter(Boolean);
+  return parts.join(" ").trim() || from.username || "Unknown";
+}
+
+function userInfoText(msg) {
+  const from = msg.from || {};
+  const username = from.username ? `@${from.username}` : "-";
+  return [
+    `From: ${userDisplayName(from)}`,
+    `Username: ${username}`,
+    `User ID: ${msg.chat.id}`,
+    "",
+    "Reply to this message or the copied message below to answer."
+  ].join("\n");
+}
+
+async function rememberAdminMessage(env, adminMessageId, userId) {
+  if (!adminMessageId) return;
+  await env.TOPIC_MAP.put(
+    `admin_msg:${adminMessageId}`,
+    JSON.stringify({userId: Number(userId), ts: Date.now()}),
+    {expirationTtl: CONFIG.VERIFIED_EXPIRE_SECONDS}
+  );
+}
+
+async function upsertUserRecord(msg, env) {
+  const userId = msg.chat.id;
+  const key = `user:${userId}`;
+  const existing = await safeGetJSON(env, key, {});
+  const from = msg.from || {};
+  const rec = {
+    ...existing,
+    userId,
+    first_name: from.first_name || "",
+    last_name: from.last_name || "",
+    username: from.username || "",
+    title: userDisplayName(from),
+    last_message_at: Date.now()
+  };
+  await env.TOPIC_MAP.put(key, JSON.stringify(rec));
+  return rec;
+}
+
+async function resolveReplyUserId(msg, env) {
+  const replyMessageId = msg.reply_to_message?.message_id;
+  if (!replyMessageId) return null;
+  const rec = await safeGetJSON(env, `admin_msg:${replyMessageId}`, null);
+  return rec?.userId ? Number(rec.userId) : null;
+}
+
+async function forwardToAdmin(msg, userId, key, env, ctx) {
+  const rec = await upsertUserRecord(msg, env);
+  if (rec.closed) {
+    await tgCall(env, "sendMessage", {chat_id: userId, text: "This conversation is closed."});
+    return;
+  }
+
+  const adminChatId = getAdminChatId(env);
+  const header = await tgCall(env, "sendMessage", {
+    chat_id: adminChatId,
+    text: userInfoText(msg)
+  });
+
+  if (!header.ok) {
+    Logger.error('admin_notify_failed', header.description || 'unknown', {userId});
+    await tgCall(env, "sendMessage", {
+      chat_id: userId,
+      text: "Admin is not reachable. Please try again later."
+    });
+    return;
+  }
+
+  await rememberAdminMessage(env, header.result?.message_id, userId);
+
+  const copied = await tgCall(env, "copyMessage", {
+    chat_id: adminChatId,
+    from_chat_id: userId,
+    message_id: msg.message_id
+  });
+
+  if (copied.ok) {
+    await rememberAdminMessage(env, copied.result?.message_id, userId);
+    return;
+  }
+
+  Logger.warn('copy_to_admin_failed', {userId, description: copied.description});
+  if (msg.text) {
+    const fallback = await tgCall(env, "sendMessage", {
+      chat_id: adminChatId,
+      text: msg.text
+    });
+    if (fallback.ok) {
+      await rememberAdminMessage(env, fallback.result?.message_id, userId);
+    }
+  }
+}
+
+async function handlePrivateAdminMessage(msg, env, ctx) {
+  const adminChatId = getAdminChatId(env);
+  const text = (msg.text || "").trim();
+
+  if (text === "/start") {
+    await tgCall(env, "sendMessage", {
+      chat_id: adminChatId,
+      text: "Private relay mode is ready. Reply to a user message to answer."
+    });
+    return;
+  }
+
+  if (text === "/id") {
+    await tgCall(env, "sendMessage", {
+      chat_id: adminChatId,
+      text: `Your chat id is ${adminChatId}`
+    });
+    return;
+  }
+
+  const userId = await resolveReplyUserId(msg, env);
+  if (!userId) {
+    await tgCall(env, "sendMessage", {
+      chat_id: adminChatId,
+      text: "Reply to a forwarded user message first."
+    });
+    return;
+  }
+
+  if (text === "/close") {
+    const key = `user:${userId}`;
+    const rec = await safeGetJSON(env, key, {});
+    rec.closed = true;
+    await env.TOPIC_MAP.put(key, JSON.stringify(rec));
+    await tgCall(env, "sendMessage", {chat_id: adminChatId, text: "Conversation closed."});
+    return;
+  }
+
+  if (text === "/open") {
+    const key = `user:${userId}`;
+    const rec = await safeGetJSON(env, key, {});
+    rec.closed = false;
+    await env.TOPIC_MAP.put(key, JSON.stringify(rec));
+    await tgCall(env, "sendMessage", {chat_id: adminChatId, text: "Conversation opened."});
+    return;
+  }
+
+  if (text === "/ban") {
+    await env.TOPIC_MAP.put(`banned:${userId}`, "1");
+    await tgCall(env, "sendMessage", {chat_id: adminChatId, text: "User banned."});
+    return;
+  }
+
+  if (text === "/unban") {
+    await env.TOPIC_MAP.delete(`banned:${userId}`);
+    await tgCall(env, "sendMessage", {chat_id: adminChatId, text: "User unbanned."});
+    return;
+  }
+
+  if (text === "/info") {
+    const rec = await safeGetJSON(env, `user:${userId}`, {});
+    const banned = await env.TOPIC_MAP.get(`banned:${userId}`);
+    await tgCall(env, "sendMessage", {
+      chat_id: adminChatId,
+      text: `User ID: ${userId}\nName: ${rec.title || "-"}\nUsername: ${rec.username ? `@${rec.username}` : "-"}\nClosed: ${rec.closed ? "yes" : "no"}\nBanned: ${banned ? "yes" : "no"}`
+    });
+    return;
+  }
+
+  const copied = await tgCall(env, "copyMessage", {
+    chat_id: userId,
+    from_chat_id: adminChatId,
+    message_id: msg.message_id
+  });
+
+  if (!copied.ok) {
+    Logger.warn('copy_to_user_failed', {userId, description: copied.description});
+    await tgCall(env, "sendMessage", {
+      chat_id: adminChatId,
+      text: `Failed to send: ${copied.description || "unknown error"}`
+    });
+  }
+}
+
 async function handlePrivateMessage(msg, env, ctx) {
   const userId = msg.chat.id;
   const key = `user:${userId}`;
+
+  if (isAdminMessage(msg, env)) {
+      await handlePrivateAdminMessage(msg, env, ctx);
+      return;
+  }
 
   // 速率限制检查
   const rateLimit = await checkRateLimit(userId, env, 'message', CONFIG.RATE_LIMIT_MESSAGE, CONFIG.RATE_LIMIT_WINDOW);
@@ -491,7 +684,7 @@ async function handlePrivateMessage(msg, env, ctx) {
     return;
   }
 
-  await forwardToTopic(msg, userId, key, env, ctx);
+  await forwardToAdmin(msg, userId, key, env, ctx);
 }
 
 async function forwardToTopic(msg, userId, key, env, ctx) {
@@ -1018,7 +1211,7 @@ async function handleCallbackQuery(query, env, ctx) {
                             from: query.from,
                         };
 
-                        await forwardToTopic(fakeMsg, userId, `user:${userId}`, env, ctx);
+                        await forwardToAdmin(fakeMsg, userId, `user:${userId}`, env, ctx);
                         await env.TOPIC_MAP.put(forwardedKey, "1", { expirationTtl: 3600 });
                         forwardedCount++;
                     }
